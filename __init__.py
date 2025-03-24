@@ -109,7 +109,6 @@ class FavaGitSync(FavaExtensionBase):
         if count_ahead == "error":
             return -1
 
-        print("Test", int(count_ahead))
         return int(count_ahead)
 
     def _rebase_fix(self):
