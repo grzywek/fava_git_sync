@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import os
 import datetime
+import json
 from pathlib import Path
 import subprocess
 
@@ -17,128 +17,189 @@ class FavaGitSync(FavaExtensionBase):
     has_js_module = True
 
     last_remote_check = None
+    remote_check_delay_seconds = 30
 
-    remote_check_delay_seconds = 10
+    cached_local_ahead = 0
+    cached_remote_ahead = 0
 
     @extension_endpoint("sync", ["GET"])
     def sync(self) -> Response:
-        # If we ran into a rebase issue, we only commit and push
-        git_dir = self._check_output(["git", "rev-parse", "--git-dir"])
-        if git_dir == "error":
-            return Response("", 500)
-        ledger_folder = Path(self.ledger.beancount_file_path).parent
-        if os.path.exists(
-            Path.joinpath(ledger_folder, git_dir, "rebase-apply")
-        ) or os.path.exists(Path.joinpath(ledger_folder, git_dir, "rebase-merge")):
-            return self._rebase_fix()
+        # Auto-commit if there are uncommitted changes
+        has_dirty = self._is_dirty()
+        if has_dirty:
+            st = self._run(["git", "add", "-A"])
+            if st["returncode"] != 0:
+                return self._error_response("git add -A failed", st)
 
-        have_local_changes = True
-        st = self._run(["git", "diff", "--no-ext-diff", "--quiet", "--exit-code"])
-        if st != 1:
-            have_local_changes = False
-
-        if have_local_changes:
-            st = self._run(["git", "add", Path(self.ledger.beancount_file_path).name])
-            if st != 0:
-                return Response("", 500)
-
-            now = (
-                datetime.datetime.now().astimezone().replace(microsecond=0).isoformat()
-            )
+            now = datetime.datetime.now().astimezone().replace(microsecond=0).isoformat()
             st = self._run(["git", "commit", "-m", now])
-            if st != 0:
-                return Response("", 500)
+            if st["returncode"] != 0:
+                return self._error_response("git commit failed", st)
 
-        ahead_count = self._get_remote_ahead_count()
-        if ahead_count < 0:
-            return Response("", 500)
-        if ahead_count > 0:
-            st = self._run(["git", "pull", "--rebase"])
-            if st != 0:
-                return Response("", 500)
+        # Pull then push
+        st = self._run(["git", "pull", "--rebase"])
+        if st["returncode"] != 0:
+            return self._error_response("git pull --rebase failed", st)
 
-        if have_local_changes:
-            st = self._run(["git", "push", "--quiet"])
-            if st != 0:
-                return Response("", 500)
+        st = self._run(["git", "push", "--quiet"])
+        if st["returncode"] != 0:
+            return self._error_response("git push --quiet failed", st)
 
-        return Response("", 200)
+        self.cached_local_ahead = 0
+        self.cached_remote_ahead = 0
+        self.last_remote_check = datetime.datetime.now()
+
+        return Response(
+            json.dumps({"ok": True}),
+            200,
+            mimetype="application/json",
+        )
 
     @extension_endpoint("status", ["GET"])
     def status(self) -> Response:
-        """250 -> git dirty, 200 -> clean"""
-        remote_ahead_count = ""
         now = datetime.datetime.now()
-        if self.last_remote_check == None or (
-            (now - self.last_remote_check).total_seconds()
-            > self.remote_check_delay_seconds
+
+        if self.last_remote_check is None or (
+            (now - self.last_remote_check).total_seconds() > self.remote_check_delay_seconds
         ):
-            remote_ahead_count = self._get_remote_ahead_count()
-            if remote_ahead_count >= 0:
+            counts = self._get_ahead_counts()
+            if counts["ok"]:
+                self.cached_local_ahead = counts["local_ahead"]
+                self.cached_remote_ahead = counts["remote_ahead"]
                 self.last_remote_check = now
+            else:
+                return self._error_response("status: failed to get ahead counts", counts)
 
-        if remote_ahead_count != "" and remote_ahead_count < 0:
-            return Response("", 500)
+        dirty = self._is_dirty()
 
+        body = json.dumps({
+            "local_ahead": self.cached_local_ahead,
+            "remote_ahead": self.cached_remote_ahead,
+            "dirty": dirty,
+        })
+        return Response(body, 200, mimetype="application/json")
+
+    def _is_dirty(self) -> bool:
         st = self._run(["git", "diff", "--no-ext-diff", "--quiet", "--exit-code"])
-        if st == 1:
-            return Response(f"{remote_ahead_count}", 250)
+        if st["returncode"] == 1:
+            return True
+        # Also check staged/untracked
+        st = self._run(["git", "status", "--porcelain"])
+        return st["stdout"] != ""
 
-        return Response(f"{remote_ahead_count}", 200)
-
-    def _get_remote_ahead_count(self) -> int:
+    def _get_ahead_counts(self) -> dict:
         st = self._run(["git", "fetch"])
-        if st != 0:
-            return -1
+        if st["returncode"] != 0:
+            return self._failure("git fetch failed", st)
 
-        current_branch = self._check_output(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"]
-        )
-        if current_branch == "error":
-            return -1
+        current_branch = self._check_output(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+        if current_branch["ok"] is False:
+            return self._failure("get current branch failed", current_branch)
 
         remote_branch = self._check_output(
-            ["git", "rev-parse", "--abbrev-ref", f"{current_branch}@{{upstream}}"]
+            ["git", "rev-parse", "--abbrev-ref", f"{current_branch['stdout']}@{{upstream}}"]
         )
-        if remote_branch == "error":
-            return -1
+        if remote_branch["ok"] is False:
+            return self._failure("get upstream branch failed", remote_branch)
 
-        count_ahead = self._check_output(
-            ["git", "rev-list", f"HEAD..{remote_branch}", "--count"]
+        # Commits on remote not in local
+        remote_ahead = self._check_output(
+            ["git", "rev-list", f"HEAD..{remote_branch['stdout']}", "--count"]
         )
-        if count_ahead == "error":
-            return -1
+        if remote_ahead["ok"] is False:
+            return self._failure("git rev-list remote ahead failed", remote_ahead)
 
-        return int(count_ahead)
+        # Commits in local not on remote
+        local_ahead = self._check_output(
+            ["git", "rev-list", f"{remote_branch['stdout']}..HEAD", "--count"]
+        )
+        if local_ahead["ok"] is False:
+            return self._failure("git rev-list local ahead failed", local_ahead)
 
-    def _rebase_fix(self):
-        st = self._run(["git", "add", Path(self.ledger.beancount_file_path).name])
-        if st != 0:
-            return Response("", 500)
-
-        now = datetime.datetime.now().astimezone().replace(microsecond=0).isoformat()
-
-        st = self._run(["git", "commit", "-m", f"fixed rebase conflict {now}"])
-        if st != 0:
-            return Response("", 500)
-
-        st = self._run(["git", "rebase", "--continue"])
-        if st != 0:
-            return Response("", 500)
-
-        st = self._run(["git", "push", "--quiet"])
-        if st != 0:
-            return Response("", 500)
-
-        return Response("", 200)
-
-    def _run(self, args: list[str]) -> int:
-        cwd = Path(self.ledger.beancount_file_path).parent
-        return subprocess.call(args, cwd=cwd, stdout=subprocess.DEVNULL)
-
-    def _check_output(self, args: list[str]) -> str:
         try:
-            cwd = Path(self.ledger.beancount_file_path).parent
-            return subprocess.check_output(args, text=True, cwd=cwd).strip()
-        except:
-            return "error"
+            return {
+                "ok": True,
+                "local_ahead": int(local_ahead["stdout"]),
+                "remote_ahead": int(remote_ahead["stdout"]),
+            }
+        except ValueError as exc:
+            return self._failure(f"failed to parse ahead counts: {exc}", {})
+
+    def _run(self, args: list[str]) -> dict:
+        cwd = Path(self.ledger.beancount_file_path).parent
+        proc = subprocess.run(
+            args,
+            cwd=cwd,
+            text=True,
+            capture_output=True,
+        )
+        result = {
+            "ok": proc.returncode == 0,
+            "returncode": proc.returncode,
+            "stdout": proc.stdout.strip(),
+            "stderr": proc.stderr.strip(),
+            "command": " ".join(args),
+            "cwd": str(cwd),
+        }
+        print(f"[FavaGitSync] RUN {result}")
+        return result
+
+    def _check_output(self, args: list[str]) -> dict:
+        cwd = Path(self.ledger.beancount_file_path).parent
+        try:
+            proc = subprocess.run(
+                args,
+                cwd=cwd,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            result = {
+                "ok": True,
+                "stdout": proc.stdout.strip(),
+                "stderr": proc.stderr.strip(),
+                "returncode": proc.returncode,
+                "command": " ".join(args),
+                "cwd": str(cwd),
+            }
+            print(f"[FavaGitSync] CHECK {result}")
+            return result
+        except subprocess.CalledProcessError as exc:
+            result = {
+                "ok": False,
+                "stdout": (exc.stdout or "").strip(),
+                "stderr": (exc.stderr or "").strip(),
+                "returncode": exc.returncode,
+                "command": " ".join(args),
+                "cwd": str(cwd),
+            }
+            print(f"[FavaGitSync] CHECK FAILED {result}")
+            return result
+        except Exception as exc:
+            result = {
+                "ok": False,
+                "stdout": "",
+                "stderr": str(exc),
+                "returncode": -1,
+                "command": " ".join(args),
+                "cwd": str(cwd),
+            }
+            print(f"[FavaGitSync] CHECK EXCEPTION {result}")
+            return result
+
+    def _failure(self, message: str, data: dict) -> dict:
+        merged = {"ok": False, "message": message}
+        merged.update(data)
+        return merged
+
+    def _error_response(self, message: str, data: dict) -> Response:
+        body = (
+            f"{message}\n"
+            f"command: {data.get('command', '')}\n"
+            f"cwd: {data.get('cwd', '')}\n"
+            f"returncode: {data.get('returncode', '')}\n"
+            f"stdout:\n{data.get('stdout', '')}\n"
+            f"stderr:\n{data.get('stderr', '')}\n"
+        )
+        print(f"[FavaGitSync] ERROR\n{body}")
+        return Response(body, 500, mimetype="text/plain")
