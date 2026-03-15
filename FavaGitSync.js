@@ -1,7 +1,7 @@
 export default {
   guessURL() {
-    const homeLink = document.querySelector("header a");
-    return homeLink.href.replace(/\/+$/, "");
+    // Module is loaded from {base}/extension_js_module/FavaGitSync.js
+    return import.meta.url.replace(/\/extension_js_module\/FavaGitSync\.js.*$/, "");
   },
 
   guessedURL: "",
