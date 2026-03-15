@@ -30,7 +30,7 @@ export default {
         } else {
           this.updateIndicator("❌");
         }
-      } catch {
+      } catch (e) {
         this.updateIndicator("❌");
       }
       syncButton.disabled = false;
@@ -61,7 +61,7 @@ export default {
       } else {
         this.updateIndicator("🟢");
       }
-    } catch {
+    } catch (e) {
       this.updateIndicator("❌");
     }
   },
